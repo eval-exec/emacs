@@ -891,19 +891,28 @@ Return the buffer."
       (funcall (xwidget-get source 'display-callback)
                xwidget source))))
 
-(defun xwidget-webkit-display-callback (xwidget _source)
-  "Import XWIDGET and display it."
-  (display-buffer (xwidget-webkit-import-widget xwidget)))
+(defun xwidget-webkit-display-callback (xwidget source)
+  "Import XWIDGET and display it.
+Prefer showing the new buffer in the same window as SOURCE."
+  (let* ((buffer (xwidget-webkit-import-widget xwidget))
+         (source-buffer (and source (xwidget-buffer source)))
+         (window (and (buffer-live-p source-buffer)
+                      (get-buffer-window source-buffer t))))
+    (if (window-live-p window)
+        (with-selected-window window
+          (switch-to-buffer buffer))
+      (display-buffer buffer))))
 
 (define-key special-event-map [xwidget-display-event] 'xwidget-webkit-display-event)
 
 (defun xwidget-webkit-goto-url (url)
   "Goto URL with xwidget webkit."
-  (if (xwidget-webkit-current-session)
-      (progn
-        (xwidget-webkit-goto-uri (xwidget-webkit-current-session) url)
-        (switch-to-buffer (xwidget-buffer (xwidget-webkit-current-session))))
-    (xwidget-webkit-new-session url)))
+  (let ((session (xwidget-at (point-min))))
+    (if session
+        (progn
+          (xwidget-webkit-goto-uri session url)
+          (switch-to-buffer (xwidget-buffer session)))
+      (xwidget-webkit-new-session url))))
 
 (defun xwidget-webkit-back ()
   "Go back to previous URL in xwidget webkit buffer."

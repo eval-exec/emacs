@@ -27,6 +27,7 @@ struct glyph_string;
 struct xwidget;
 struct xwidget_view;
 struct window;
+struct atimer;
 
 #ifdef HAVE_XWIDGETS
 
@@ -45,6 +46,16 @@ struct window;
 
 #ifdef HAVE_XINPUT2
 #include <X11/extensions/XInput2.h>
+#endif
+
+#ifdef HAVE_WPE
+struct wpe_view_backend;
+struct wpe_view_backend_exportable_fdo;
+struct wpe_fdo_shm_exported_buffer;
+struct wpe_fdo_egl_exported_image;
+struct wl_shm_buffer;
+typedef struct _WebKitWebView WebKitWebView;
+typedef struct _WebKitWebViewBackend WebKitWebViewBackend;
 #endif
 
 struct xwidget
@@ -79,6 +90,25 @@ struct xwidget
   struct frame *embedder;
   struct xwidget_view *embedder_view;
   guint hit_result;
+#ifdef HAVE_WPE
+  WebKitWebView *wpe_web_view;
+  WebKitWebViewBackend *wpe_web_view_backend;
+  struct wpe_view_backend_exportable_fdo *wpe_exportable;
+  struct wpe_view_backend *wpe_backend;
+  cairo_surface_t *wpe_surface;
+  unsigned char *wpe_surface_data;
+  size_t wpe_surface_size;
+  int wpe_surface_width;
+  int wpe_surface_height;
+  int wpe_surface_stride;
+  struct wpe_fdo_egl_exported_image *wpe_egl_image;
+  int wpe_egl_width;
+  int wpe_egl_height;
+  bool wpe_use_egl;
+  struct atimer *wpe_frame_watchdog;
+  bool wpe_frame_seen;
+  bool wpe_logged_no_frame;
+#endif
 #elif defined (NS_IMPL_COCOA)
 # ifdef __OBJC__
   /* For offscreen widgets, unused if not osr.  */
@@ -127,6 +157,12 @@ struct xwidget_view
 #else
   struct pgtk_display_info *dpyinfo;
   GtkWidget *widget;
+# ifdef HAVE_WPE
+  GdkGLContext *wpe_gl_context;
+  unsigned int wpe_gl_texture;
+  struct wpe_fdo_egl_exported_image *wpe_last_egl_image;
+  bool wpe_gl_import_ready;
+# endif
 #endif
   Emacs_Cursor cursor;
   struct frame *frame;

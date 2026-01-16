@@ -637,7 +637,7 @@ otherwise for the first of 'inotify', 'kqueue' or 'gfile' that is usable.])
  [with_file_notification=$with_features])
 
 OPTION_DEFAULT_OFF([xwidgets],
-  [enable use of xwidgets in Emacs buffers (requires gtk3 or macOS Cocoa)])
+  [enable use of xwidgets in Emacs buffers (requires pgtk/Wayland or macOS Cocoa)])
 
 OPTION_DEFAULT_OFF([be-app],
   [enable use of Haiku's Application Kit as a window system])
@@ -4451,33 +4451,30 @@ if test "${HAVE_X11}" = "yes"; then
   fi
 fi
 
-dnl Enable xwidgets if GTK3 and WebKitGTK+ are available.
+dnl Enable xwidgets if pgtk/Wayland and WPE WebKit are available.
 dnl Enable xwidgets if macOS Cocoa and WebKit framework are available.
 HAVE_XWIDGETS=no
 XWIDGETS_OBJ=
 if test "$with_xwidgets" != "no"; then
-  if test "$USE_GTK_TOOLKIT" = "GTK3" && test "$window_system" != "none"; then
-    WEBKIT_REQUIRED=2.12
-    WEBKIT_BROKEN=2.41.92
-    WEBKIT_MODULES="webkit2gtk-4.1 >= $WEBKIT_REQUIRED webkit2gtk-4.1 < $WEBKIT_BROKEN"
+  if test "$window_system" = "pgtk"; then
+    WEBKIT_MODULES="wpe-webkit-2.0 wpebackend-fdo-1.0 wpe-1.0 wayland-client wayland-server"
     EMACS_CHECK_MODULES([WEBKIT], [$WEBKIT_MODULES])
-    if test "$HAVE_WEBKIT" = "no"; then
-      WEBKIT_MODULES="webkit2gtk-4.0 >= $WEBKIT_REQUIRED webkit2gtk-4.0 < $WEBKIT_BROKEN"
-      EMACS_CHECK_MODULES([WEBKIT], [$WEBKIT_MODULES])
-    fi
     HAVE_XWIDGETS=$HAVE_WEBKIT
     XWIDGETS_OBJ="xwidget.o"
-    if test "$HAVE_X_WINDOWS" = "yes" && test "${with_cairo}" = "no"; then
-      CAIRO_XLIB_MODULES="cairo >= 1.8.0 cairo-xlib >= 1.8.0"
-      EMACS_CHECK_MODULES([CAIRO_XLIB], [$CAIRO_XLIB_MODULES])
-      if test $HAVE_CAIRO_XLIB = "yes"; then
-        CAIRO_CFLAGS="$CAIRO_XLIB_CFLAGS"
-	CAIRO_LIBS="$CAIRO_XLIB_LIBS"
-	AC_SUBST([CAIRO_CFLAGS])
-	AC_SUBST([CAIRO_LIBS])
-      else
-        AC_MSG_ERROR([xwidgets requested, but a suitable cairo installation wasn't found])
+    if test "$HAVE_XWIDGETS" = "yes"; then
+      AC_DEFINE([HAVE_WPE], [1], [Define to 1 if using WPE WebKit.])
+      dnl Optional: EGL path for WPE (performance)
+      PKG_CHECK_MODULES([EPOXY], [epoxy], [HAVE_EPOXY=yes], [HAVE_EPOXY=no])
+      if test "$HAVE_EPOXY" = "yes"; then
+        AC_DEFINE([HAVE_EPOXY], [1], [Define to 1 if libepoxy is available.])
+        CFLAGS="$CFLAGS $EPOXY_CFLAGS"
+        LIBS="$LIBS $EPOXY_LIBS"
+        if test "$window_system" = "pgtk"; then
+          PGTK_LIBS="$PGTK_LIBS $EPOXY_LIBS"
+        fi
       fi
+      AC_SUBST([EPOXY_CFLAGS])
+      AC_SUBST([EPOXY_LIBS])
     fi
   elif test "${NS_IMPL_COCOA}" = "yes"; then
     dnl FIXME: Check framework WebKit2
@@ -4500,11 +4497,11 @@ if test "$with_xwidgets" != "no"; then
     dnl Update NS_OBJC_OBJ with added nsxwidget.o
     AC_SUBST([NS_OBJC_OBJ])
   else
-    AC_MSG_ERROR([xwidgets requested, it requires GTK3 as X window toolkit or macOS Cocoa as window system.])
+    AC_MSG_ERROR([xwidgets requested, it requires pgtk/Wayland (WPE) or macOS Cocoa as window system.])
   fi
 
   test $HAVE_XWIDGETS = yes ||
-    AC_MSG_ERROR([xwidgets requested but WebKitGTK+ or WebKit framework not found.])
+    AC_MSG_ERROR([xwidgets requested but WPE WebKit or WebKit framework not found.])
 
   AC_DEFINE([HAVE_XWIDGETS], [1], [Define to 1 if you have xwidgets support.])
 fi
