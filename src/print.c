@@ -1843,9 +1843,15 @@ print_vectorlike_unreadable (Lisp_Object obj, Lisp_Object printcharfun,
 	else
 	  {
 #ifdef USE_GTK
+#ifdef HAVE_WPE
+	    int len = sprintf (buf, "#<xwidget %u %p>",
+			       XXWIDGET (obj)->xwidget_id,
+			       XXWIDGET (obj)->wpe_web_view);
+#else
 	    int len = sprintf (buf, "#<xwidget %u %p>",
 			       XXWIDGET (obj)->xwidget_id,
 			       XXWIDGET (obj)->widget_osr);
+#endif
 #else
 	    int len = sprintf (buf, "#<xwidget %u %p>",
 			       XXWIDGET (obj)->xwidget_id,

@@ -28,15 +28,36 @@ along with GNU Emacs.  If not, see <https://www.gnu.org/licenses/>.  */
 #include "frame.h"
 #include "keyboard.h"
 #include "gtkutil.h"
+#include "systime.h"
 #include "sysstdio.h"
 #include "termhooks.h"
 #include "window.h"
 #include "process.h"
+#include "atimer.h"
+
+#include <errno.h>
+#include <string.h>
+#include <unistd.h>
 
 /* Include xwidget bottom end headers.  */
 #ifdef USE_GTK
-#include <webkit2/webkit2.h>
-#include <JavaScriptCore/JavaScript.h>
+#ifndef HAVE_WPE
+#error "xwidgets on GTK require WPE WebKit (WebKitGTK support removed)"
+#endif
+#include <wpe/webkit.h>
+#include <wpe/fdo.h>
+#ifdef HAVE_EPOXY
+#include <wpe/fdo-egl.h>
+#include <epoxy/egl.h>
+#include <epoxy/gl.h>
+#endif
+#include <jsc/jsc.h>
+#include <wayland-client.h>
+#include <wayland-server-core.h>
+#ifdef HAVE_PGTK
+#include <gdk/gdkcairo.h>
+#include <gdk/gdkwayland.h>
+#endif
 #include <cairo.h>
 #ifndef HAVE_PGTK
 #include <cairo-xlib.h>
@@ -52,28 +73,432 @@ along with GNU Emacs.  If not, see <https://www.gnu.org/licenses/>.  */
 #endif
 
 #include <math.h>
+#include <stdarg.h>
+#include <stdlib.h>
 
 static Lisp_Object id_to_xwidget_map;
 static Lisp_Object internal_xwidget_view_list;
 static Lisp_Object internal_xwidget_list;
 static uint32_t xwidget_counter = 0;
 
+#ifdef HAVE_WPE
+#ifdef HAVE_EPOXY
+static bool wpe_egl_initialized = false;
+static bool wpe_egl_available = false;
+#endif
+static bool wpe_debug_enabled = false;
+static bool wpe_logged_egl_image = false;
+static bool wpe_logged_egl_draw = false;
+static bool wpe_logged_egl_fail_size = false;
+static bool wpe_logged_egl_fail_gl = false;
+static bool wpe_logged_egl_fail_window = false;
+#if WEBKIT_CHECK_VERSION(2, 28, 0)
+static bool wpe_sandbox_paths_added = false;
+#endif
+
+static void wpe_start_frame_watchdog (struct xwidget *xw);
+static void wpe_cancel_frame_watchdog (struct xwidget *xw);
+
+static void
+wpe_debug (const char *fmt, ...)
+{
+  if (!wpe_debug_enabled)
+    {
+      const char *env = getenv ("XWIDGET_WPE_DEBUG");
+      wpe_debug_enabled = (env && env[0] != '\0');
+    }
+  if (!wpe_debug_enabled)
+    return;
+
+  va_list args;
+  va_start (args, fmt);
+  fprintf (stderr, "xwidget-wpe: ");
+  vfprintf (stderr, fmt, args);
+  fprintf (stderr, "\n");
+  va_end (args);
+}
+
+#if WEBKIT_CHECK_VERSION(2, 28, 0)
+static void
+wpe_add_sandbox_path_if_exists (WebKitWebContext *ctx, const char *path,
+				gboolean read_only)
+{
+  if (!ctx || !path || !path[0])
+    return;
+  if (access (path, F_OK) != 0)
+    return;
+
+  webkit_web_context_add_path_to_sandbox (ctx, path, read_only);
+  wpe_debug ("sandbox path %s (%s)", path, read_only ? "ro" : "rw");
+}
+
+static void
+wpe_add_sandbox_paths_from_env (WebKitWebContext *ctx, const char *paths_env)
+{
+  if (!paths_env || !paths_env[0])
+    return;
+
+  char *paths = xstrdup (paths_env);
+  char *save = NULL;
+  for (char *entry = strtok_r (paths, ":", &save);
+       entry;
+       entry = strtok_r (NULL, ":", &save))
+    {
+      gboolean read_only = TRUE;
+      const char *path = entry;
+      if (strncmp (entry, "rw:", 3) == 0)
+	{
+	  read_only = FALSE;
+	  path = entry + 3;
+	}
+      else if (strncmp (entry, "ro:", 3) == 0)
+	{
+	  read_only = TRUE;
+	  path = entry + 3;
+	}
+      wpe_add_sandbox_path_if_exists (ctx, path, read_only);
+    }
+  xfree (paths);
+}
+#endif
+
+static void
+wpe_frame_watchdog_cb (struct atimer *timer)
+{
+  struct xwidget *xw = timer ? timer->client_data : NULL;
+  if (!xw)
+    return;
+
+  xw->wpe_frame_watchdog = NULL;
+  if (NILP (xw->buffer) || xw->wpe_frame_seen)
+    return;
+
+  if (!xw->wpe_logged_no_frame)
+    {
+      xw->wpe_logged_no_frame = true;
+      wpe_debug ("no frames received after startup; if WPEWebProcess logs EGLImage dma-buf import errors, issue is outside Emacs");
+    }
+}
+
+static void
+wpe_start_frame_watchdog (struct xwidget *xw)
+{
+  if (!xw || xw->wpe_frame_watchdog)
+    return;
+
+  struct timespec ts = make_timespec (2, 0);
+  xw->wpe_frame_watchdog =
+    start_atimer (ATIMER_RELATIVE, ts, wpe_frame_watchdog_cb, xw);
+}
+
+static void
+wpe_cancel_frame_watchdog (struct xwidget *xw)
+{
+  if (!xw || !xw->wpe_frame_watchdog)
+    return;
+
+  cancel_atimer (xw->wpe_frame_watchdog);
+  xw->wpe_frame_watchdog = NULL;
+}
+
+static void
+wpe_debug_once (bool *flag, const char *fmt, ...)
+{
+  if (*flag)
+    return;
+
+  if (!wpe_debug_enabled)
+    {
+      const char *env = getenv ("XWIDGET_WPE_DEBUG");
+      wpe_debug_enabled = (env && env[0] != '\0');
+    }
+  if (!wpe_debug_enabled)
+    return;
+
+  *flag = true;
+  va_list args;
+  va_start (args, fmt);
+  fprintf (stderr, "xwidget-wpe: ");
+  vfprintf (stderr, fmt, args);
+  fprintf (stderr, "\n");
+  va_end (args);
+}
+
+static double
+wpe_scroll_multiplier (void)
+{
+  const char *env = getenv ("XWIDGET_WPE_SCROLL_MULTIPLIER");
+  if (!env || !*env)
+    return 1.0;
+
+  char *end = NULL;
+  double value = strtod (env, &end);
+  if (end == env || value <= 0.0)
+    return 1.0;
+
+  return value;
+}
+
+static bool
+wpe_scroll_invert (void)
+{
+  const char *env = getenv ("XWIDGET_WPE_SCROLL_INVERT");
+  if (env && *env && strcmp (env, "0") == 0)
+    return false;
+
+  return true;
+}
+
+#ifdef HAVE_EPOXY
+static void
+wpe_maybe_set_web_render_device (EGLDisplay egl_display)
+{
+#if defined(EGL_EXT_device_base) && defined(EGL_EXT_device_drm)
+  const char *env = getenv ("WEBKIT_WEB_RENDER_DEVICE_FILE");
+  if (env && *env)
+    {
+      wpe_debug ("WEBKIT_WEB_RENDER_DEVICE_FILE already set: %s", env);
+      return;
+    }
+
+  if (!epoxy_has_egl_extension (egl_display, "EGL_EXT_device_query")
+      && !epoxy_has_egl_extension (egl_display, "EGL_EXT_device_base"))
+    return;
+  if (!epoxy_has_egl_extension (egl_display, "EGL_EXT_device_drm"))
+    return;
+
+  EGLAttrib device = 0;
+  if (!eglQueryDisplayAttribEXT (egl_display, EGL_DEVICE_EXT, &device))
+    return;
+  if (!device)
+    return;
+
+  const char *drm_device =
+    eglQueryDeviceStringEXT ((EGLDeviceEXT) device, EGL_DRM_DEVICE_FILE_EXT);
+  if (!drm_device || !*drm_device)
+    return;
+
+  setenv ("WEBKIT_WEB_RENDER_DEVICE_FILE", drm_device, 0);
+  wpe_debug ("WEBKIT_WEB_RENDER_DEVICE_FILE set to %s", drm_device);
+#else
+  (void) egl_display;
+#endif
+}
+
+static bool
+wpe_try_initialize_egl (void)
+{
+  if (wpe_egl_initialized)
+    return wpe_egl_available;
+
+  wpe_egl_initialized = true;
+  wpe_debug ("initializing EGL via WPE");
+
+#ifdef HAVE_PGTK
+  GdkDisplay *display = gdk_display_get_default ();
+  if (!display || !GDK_IS_WAYLAND_DISPLAY (display))
+    return false;
+
+  struct wl_display *wl_display = gdk_wayland_display_get_wl_display (display);
+  if (!wl_display)
+    return false;
+
+  EGLDisplay egl_display =
+    eglGetDisplay ((EGLNativeDisplayType) wl_display);
+  if (egl_display == EGL_NO_DISPLAY)
+    return false;
+
+  EGLint egl_major = 0, egl_minor = 0;
+  if (!eglInitialize (egl_display, &egl_major, &egl_minor))
+    return false;
+
+  wpe_maybe_set_web_render_device (egl_display);
+
+  if (!wpe_fdo_initialize_for_egl_display (egl_display))
+    return false;
+
+  wpe_debug ("EGL initialized for WPE (version %d.%d)", egl_major, egl_minor);
+  wpe_egl_available = true;
+#endif
+
+  return wpe_egl_available;
+}
+#endif
+
+#if WEBKIT_CHECK_VERSION(2, 40, 0)
+static bool
+wpe_mkdir_if_missing (const char *path)
+{
+  if (emacs_mkdir (path, 0777) == 0)
+    return true;
+  return errno == EEXIST;
+}
+
+static const char *
+wpe_cookies_path_from_data_dir (const char *data_dir, char **storage)
+{
+  const char *suffix = "cookies.sqlite";
+  size_t dir_len = strlen (data_dir);
+  bool has_slash = dir_len > 0 && data_dir[dir_len - 1] == '/';
+  size_t total = dir_len + (has_slash ? 0 : 1) + strlen (suffix) + 1;
+  char *path = xmalloc (total);
+  if (has_slash)
+    snprintf (path, total, "%s%s", data_dir, suffix);
+  else
+    snprintf (path, total, "%s/%s", data_dir, suffix);
+  *storage = path;
+  return path;
+}
+
+static WebKitNetworkSession *
+wpe_network_session_from_emacs (bool *needs_unref)
+{
+  Lisp_Object base_dir = Fsymbol_value (Quser_emacs_directory);
+  if (!STRINGP (base_dir))
+    {
+      if (needs_unref)
+	*needs_unref = false;
+      return webkit_network_session_get_default ();
+    }
+
+  Lisp_Object cache_base =
+    Fexpand_file_name (build_string (".cache/"), base_dir);
+  Lisp_Object cache_dir =
+    Fexpand_file_name (build_string ("wpewebkit/"), cache_base);
+  Lisp_Object local_base =
+    Fexpand_file_name (build_string (".local/"), base_dir);
+  Lisp_Object state_base =
+    Fexpand_file_name (build_string ("state/"), local_base);
+  Lisp_Object data_dir =
+    Fexpand_file_name (build_string ("wpewebkit/"), state_base);
+
+  const char *cache_base_c = SSDATA (ENCODE_FILE (cache_base));
+  const char *cache_dir_c = SSDATA (ENCODE_FILE (cache_dir));
+  const char *local_base_c = SSDATA (ENCODE_FILE (local_base));
+  const char *state_base_c = SSDATA (ENCODE_FILE (state_base));
+  const char *data_dir_c = SSDATA (ENCODE_FILE (data_dir));
+
+  if (!wpe_mkdir_if_missing (cache_base_c)
+      || !wpe_mkdir_if_missing (cache_dir_c)
+      || !wpe_mkdir_if_missing (local_base_c)
+      || !wpe_mkdir_if_missing (state_base_c)
+      || !wpe_mkdir_if_missing (data_dir_c))
+    {
+      if (needs_unref)
+	*needs_unref = false;
+      return webkit_network_session_get_default ();
+    }
+
+  WebKitNetworkSession *session =
+    webkit_network_session_new (data_dir_c, cache_dir_c);
+  if (!session)
+    {
+      if (needs_unref)
+	*needs_unref = false;
+      return webkit_network_session_get_default ();
+    }
+
+  WebKitCookieManager *cookie_manager =
+    webkit_network_session_get_cookie_manager (session);
+  if (cookie_manager)
+    {
+      char *cookie_path_storage = NULL;
+      const char *cookie_path =
+	wpe_cookies_path_from_data_dir (data_dir_c, &cookie_path_storage);
+      webkit_cookie_manager_set_persistent_storage
+	(cookie_manager, cookie_path, WEBKIT_COOKIE_PERSISTENT_STORAGE_SQLITE);
+      xfree (cookie_path_storage);
+
+      const char *policy_env = getenv ("XWIDGET_WPE_COOKIE_POLICY");
+      if (policy_env && *policy_env)
+	{
+	  WebKitCookieAcceptPolicy policy = WEBKIT_COOKIE_POLICY_ACCEPT_NO_THIRD_PARTY;
+	  if (strcmp (policy_env, "always") == 0)
+	    policy = WEBKIT_COOKIE_POLICY_ACCEPT_ALWAYS;
+	  else if (strcmp (policy_env, "never") == 0)
+	    policy = WEBKIT_COOKIE_POLICY_ACCEPT_NEVER;
+	  webkit_cookie_manager_set_accept_policy (cookie_manager, policy);
+	}
+    }
+
+  const char *disable_itp = getenv ("XWIDGET_WPE_DISABLE_ITP");
+  if (disable_itp && *disable_itp && strcmp (disable_itp, "0") != 0)
+    webkit_network_session_set_itp_enabled (session, FALSE);
+
+  if (needs_unref)
+    *needs_unref = true;
+  return session;
+}
+#endif
+
+static void
+wpe_web_view_backend_noop_destroy (void *data)
+{
+  (void) data;
+}
+
+static void
+wpe_queue_redraw (struct xwidget *xw)
+{
+#ifdef HAVE_PGTK
+  for (Lisp_Object tail = internal_xwidget_view_list; CONSP (tail);
+       tail = XCDR (tail))
+    {
+      if (XWIDGET_VIEW_P (XCAR (tail)))
+	{
+	  struct xwidget_view *view = XXWIDGET_VIEW (XCAR (tail));
+	  if (XXWIDGET (view->model) == xw
+	      && view->widget
+	      && GTK_IS_WIDGET (view->widget))
+	    gtk_widget_queue_draw (view->widget);
+	}
+    }
+#endif
+}
+
+#ifdef HAVE_EPOXY
+static void
+wpe_export_egl_image (void *data, struct wpe_fdo_egl_exported_image *image)
+{
+  struct xwidget *xw = data;
+
+  if (!xw || !xw->wpe_exportable)
+    return;
+
+  if (xw->wpe_egl_image)
+    wpe_view_backend_exportable_fdo_egl_dispatch_release_exported_image
+      (xw->wpe_exportable, xw->wpe_egl_image);
+
+  xw->wpe_egl_image = image;
+  xw->wpe_egl_width = (int) wpe_fdo_egl_exported_image_get_width (image);
+  xw->wpe_egl_height = (int) wpe_fdo_egl_exported_image_get_height (image);
+  xw->wpe_frame_seen = true;
+  wpe_cancel_frame_watchdog (xw);
+
+  wpe_debug_once (&wpe_logged_egl_image, "received EGL image %dx%d",
+		  xw->wpe_egl_width, xw->wpe_egl_height);
+  wpe_queue_redraw (xw);
+  wpe_view_backend_exportable_fdo_dispatch_frame_complete
+    (xw->wpe_exportable);
+}
+#endif
+
+#ifdef HAVE_EPOXY
+static const struct wpe_view_backend_exportable_fdo_egl_client wpe_exportable_egl_client = {
+  .export_egl_image = NULL,
+  .export_fdo_egl_image = wpe_export_egl_image,
+  .export_shm_buffer = NULL,
+};
+#endif
+#endif
+
 #ifdef USE_GTK
 #ifdef HAVE_X_WINDOWS
 static Lisp_Object x_window_to_xwv_map;
-#if WEBKIT_CHECK_VERSION (2, 34, 0)
-static Lisp_Object dummy_tooltip_string;
 #endif
-#endif
-static gboolean offscreen_damage_event (GtkWidget *, GdkEvent *, gpointer);
-static void synthesize_focus_in_event (GtkWidget *);
-static GdkDevice *find_suitable_keyboard (struct frame *);
 static gboolean webkit_script_dialog_cb (WebKitWebView *, WebKitScriptDialog *,
 					 gpointer);
 static void record_osr_embedder (struct xwidget_view *);
-static void from_embedder (GdkWindow *, double, double, gpointer, gpointer, gpointer);
-static void to_embedder (GdkWindow *, double, double, gpointer, gpointer, gpointer);
-static GdkWindow *pick_embedded_child (GdkWindow *, double, double, gpointer);
 #endif
 
 static struct xwidget *
@@ -91,6 +516,8 @@ allocate_xwidget_view (void)
 #define XSETXWIDGET(a, b) XSETPSEUDOVECTOR (a, b, PVEC_XWIDGET)
 #define XSETXWIDGET_VIEW(a, b) XSETPSEUDOVECTOR (a, b, PVEC_XWIDGET_VIEW)
 
+#define XWIDGET_WEBKIT_VIEW(xw) ((xw)->wpe_web_view)
+
 static struct xwidget_view *xwidget_view_lookup (struct xwidget *,
 						 struct window *);
 static void kill_xwidget (struct xwidget *);
@@ -103,7 +530,7 @@ static void webkit_javascript_finished_cb (GObject *,
                                            GAsyncResult *,
                                            gpointer);
 static gboolean webkit_download_cb (WebKitWebContext *, WebKitDownload *, gpointer);
-static GtkWidget *webkit_create_cb (WebKitWebView *, WebKitNavigationAction *, gpointer);
+static WebKitWebView *webkit_create_cb (WebKitWebView *, WebKitNavigationAction *, gpointer);
 static gboolean
 webkit_decide_policy_cb (WebKitWebView *,
                          WebKitPolicyDecision *,
@@ -131,75 +558,251 @@ static void find_widget (GtkWidget *t, struct widget_search_data *);
 static void mouse_target_changed (WebKitWebView *, WebKitHitTestResult *, guint,
 				  gpointer);
 
-static int
-xw_forward_event_translate (GdkEvent *event, struct xwidget_view *xv,
-			    struct xwidget *xw)
+#ifdef HAVE_WPE
+static uint32_t
+wpe_modifiers_from_gdk (guint state)
 {
-  GtkWidget *widget;
-  int new_x, new_y;
+  uint32_t mods = 0;
+
+  if (state & GDK_CONTROL_MASK)
+    mods |= wpe_input_keyboard_modifier_control;
+  if (state & GDK_SHIFT_MASK)
+    mods |= wpe_input_keyboard_modifier_shift;
+  if (state & GDK_MOD1_MASK)
+    mods |= wpe_input_keyboard_modifier_alt;
+  if (state & GDK_META_MASK)
+    mods |= wpe_input_keyboard_modifier_meta;
+
+  if (state & GDK_BUTTON1_MASK)
+    mods |= wpe_input_pointer_modifier_button1;
+  if (state & GDK_BUTTON2_MASK)
+    mods |= wpe_input_pointer_modifier_button2;
+  if (state & GDK_BUTTON3_MASK)
+    mods |= wpe_input_pointer_modifier_button3;
+  if (state & GDK_BUTTON4_MASK)
+    mods |= wpe_input_pointer_modifier_button4;
+  if (state & GDK_BUTTON5_MASK)
+    mods |= wpe_input_pointer_modifier_button5;
+
+  return mods;
+}
+
+static void
+wpe_get_egl_flip_flags (int *flip_x, int *flip_y)
+{
+  static int cached_flip_x = -1;
+  static int cached_flip_y = -1;
+
+  if (cached_flip_x == -1)
+    {
+      const char *env = getenv ("XWIDGET_WPE_EGL_FLIP_X");
+      cached_flip_x = (env && *env && strcmp (env, "0") != 0);
+    }
+  if (cached_flip_y == -1)
+    {
+      const char *env = getenv ("XWIDGET_WPE_EGL_FLIP_Y");
+      /* Default to flipping Y for WPE EGL images. */
+      cached_flip_y = (env ? (env[0] != '\0' && strcmp (env, "0") != 0) : 1);
+    }
+
+  *flip_x = cached_flip_x;
+  *flip_y = cached_flip_y;
+}
+
+static uint32_t
+wpe_button_from_gdk (guint button)
+{
+  switch (button)
+    {
+    case 1:
+      return 1; /* Left */
+    case 2:
+      return 3; /* Middle -> WPE expects 3 */
+    case 3:
+      return 2; /* Right -> WPE expects 2 */
+    default:
+      return button;
+    }
+}
+
+static void
+wpe_adjust_pointer_coords (struct xwidget *xw, GdkWindow *window,
+			   double *x, double *y)
+{
+  int win_w = 0;
+  int win_h = 0;
+  if (window)
+    {
+      win_w = gdk_window_get_width (window);
+      win_h = gdk_window_get_height (window);
+    }
+
+  double scale_x = 1.0;
+  double scale_y = 1.0;
+  if (win_w > 0 && xw->wpe_egl_width > 0)
+    scale_x = (double) xw->wpe_egl_width / win_w;
+  if (win_h > 0 && xw->wpe_egl_height > 0)
+    scale_y = (double) xw->wpe_egl_height / win_h;
+
+  double px = *x * scale_x;
+  double py = *y * scale_y;
+
+  /* Input coordinates are in top-left origin; no flip here. */
+
+  if (xw->wpe_egl_width > 0)
+    {
+      if (px < 0)
+	px = 0;
+      else if (px > xw->wpe_egl_width - 1)
+	px = xw->wpe_egl_width - 1;
+    }
+  if (xw->wpe_egl_height > 0)
+    {
+      if (py < 0)
+	py = 0;
+      else if (py > xw->wpe_egl_height - 1)
+	py = xw->wpe_egl_height - 1;
+    }
+
+  *x = px;
+  *y = py;
+}
+
+static gboolean
+xwidget_wpe_forward_event (GdkEvent *event, struct xwidget *xw)
+{
+  if (!xw->wpe_backend)
+    return FALSE;
 
   switch (event->type)
     {
     case GDK_BUTTON_PRESS:
     case GDK_BUTTON_RELEASE:
-    case GDK_2BUTTON_PRESS:
-    case GDK_3BUTTON_PRESS:
-      widget = find_widget_at_pos (xw->widgetwindow_osr,
-				   lrint (event->button.x - xv->clip_left),
-				   lrint (event->button.y - xv->clip_top),
-				   &new_x, &new_y, false, NULL);
-      if (widget)
-	{
-	  event->any.window = gtk_widget_get_window (widget);
-	  event->button.x = new_x;
-	  event->button.y = new_y;
-	  return 1;
-	}
-      return 0;
-    case GDK_SCROLL:
-      widget = find_widget_at_pos (xw->widgetwindow_osr,
-				   lrint (event->scroll.x - xv->clip_left),
-				   lrint (event->scroll.y - xv->clip_top),
-				   &new_x, &new_y, false, NULL);
-      if (widget)
-	{
-	  event->any.window = gtk_widget_get_window (widget);
-	  event->scroll.x = new_x;
-	  event->scroll.y = new_y;
-	  return 1;
-	}
-      return 0;
+      {
+	struct wpe_input_pointer_event pe = {0};
+	double x = event->button.x;
+	double y = event->button.y;
+	wpe_adjust_pointer_coords (xw, event->any.window, &x, &y);
+	pe.type = wpe_input_pointer_event_type_button;
+	pe.time = event->button.time;
+	pe.x = lrint (x);
+	pe.y = lrint (y);
+	pe.button = wpe_button_from_gdk (event->button.button);
+	pe.state = (event->type == GDK_BUTTON_PRESS);
+	pe.modifiers = wpe_modifiers_from_gdk (event->button.state);
+	if (event->type == GDK_BUTTON_PRESS)
+	  wpe_view_backend_add_activity_state
+	    (xw->wpe_backend, wpe_view_activity_state_focused);
+	wpe_view_backend_dispatch_pointer_event (xw->wpe_backend, &pe);
+      }
+      return TRUE;
     case GDK_MOTION_NOTIFY:
-      widget = find_widget_at_pos (xw->widgetwindow_osr,
-				   lrint (event->motion.x - xv->clip_left),
-				   lrint (event->motion.y - xv->clip_top),
-				   &new_x, &new_y, false, NULL);
-      if (widget)
-	{
-	  event->any.window = gtk_widget_get_window (widget);
-	  event->motion.x = new_x;
-	  event->motion.y = new_y;
-	  return 1;
-	}
-      return 0;
-    case GDK_ENTER_NOTIFY:
-    case GDK_LEAVE_NOTIFY:
-      widget = find_widget_at_pos (xw->widgetwindow_osr,
-				   lrint (event->crossing.x - xv->clip_left),
-				   lrint (event->crossing.y - xv->clip_top),
-				   &new_x, &new_y, false, NULL);
-      if (widget)
-	{
-	  event->any.window = gtk_widget_get_window (widget);
-	  event->crossing.x = new_x;
-	  event->crossing.y = new_y;
-	  return 1;
-	}
-      return 0;
+      {
+	struct wpe_input_pointer_event pe = {0};
+	double x = event->motion.x;
+	double y = event->motion.y;
+	wpe_adjust_pointer_coords (xw, event->any.window, &x, &y);
+	pe.type = wpe_input_pointer_event_type_motion;
+	pe.time = event->motion.time;
+	pe.x = lrint (x);
+	pe.y = lrint (y);
+	pe.modifiers = wpe_modifiers_from_gdk (event->motion.state);
+	wpe_view_backend_dispatch_pointer_event (xw->wpe_backend, &pe);
+      }
+      return TRUE;
+    case GDK_SCROLL:
+      {
+	double dx = 0;
+	double dy = 0;
+	double scroll_scale = 1.0;
+	bool invert_scroll = wpe_scroll_invert ();
+	struct wpe_input_axis_2d_event ae = {0};
+	enum wpe_input_axis_event_type axis_type;
+	double x = event->scroll.x;
+	double y = event->scroll.y;
+	wpe_adjust_pointer_coords (xw, event->any.window, &x, &y);
+
+	if (event->scroll.direction == GDK_SCROLL_SMOOTH)
+	  {
+	    dx = event->scroll.delta_x;
+	    dy = event->scroll.delta_y;
+	    scroll_scale = wpe_scroll_multiplier ();
+	  }
+	else
+	  {
+	    axis_type = wpe_input_axis_event_type_motion;
+	    switch (event->scroll.direction)
+	      {
+	      case GDK_SCROLL_UP:
+		dy = -1;
+		break;
+	      case GDK_SCROLL_DOWN:
+		dy = 1;
+		break;
+	      case GDK_SCROLL_LEFT:
+		dx = -1;
+		break;
+	      case GDK_SCROLL_RIGHT:
+		dx = 1;
+		break;
+	      default:
+		break;
+	      }
+	  }
+
+	if (invert_scroll)
+	  {
+	    dx = -dx;
+	    dy = -dy;
+	  }
+	dx *= scroll_scale;
+	dy *= scroll_scale;
+
+	if (event->scroll.direction == GDK_SCROLL_SMOOTH)
+	  axis_type = wpe_input_axis_event_type_motion_smooth;
+	ae.base.type = axis_type | wpe_input_axis_event_type_mask_2d;
+	ae.base.time = event->scroll.time;
+	ae.base.x = lrint (x);
+	ae.base.y = lrint (y);
+	ae.base.modifiers = wpe_modifiers_from_gdk (event->scroll.state);
+	ae.x_axis = dx;
+	ae.y_axis = dy;
+
+	wpe_view_backend_dispatch_axis_event (xw->wpe_backend, &ae.base);
+      }
+      return TRUE;
+    case GDK_KEY_PRESS:
+    case GDK_KEY_RELEASE:
+      {
+	struct wpe_input_keyboard_event ke = {0};
+	guint keyval = event->key.keyval;
+	gunichar unicode = gdk_keyval_to_unicode (keyval);
+
+	ke.time = event->key.time;
+	ke.hardware_key_code = event->key.hardware_keycode;
+	if (unicode)
+	  ke.key_code = wpe_unicode_to_key_code (unicode);
+	else
+	  ke.key_code = keyval;
+	ke.pressed = (event->type == GDK_KEY_PRESS);
+	ke.modifiers = wpe_modifiers_from_gdk (event->key.state);
+
+	wpe_view_backend_dispatch_keyboard_event (xw->wpe_backend, &ke);
+      }
+      return TRUE;
+    case GDK_FOCUS_CHANGE:
+      if (event->focus_change.in)
+	wpe_view_backend_add_activity_state
+	  (xw->wpe_backend, wpe_view_activity_state_focused);
+      else
+	wpe_view_backend_remove_activity_state
+	  (xw->wpe_backend, wpe_view_activity_state_focused);
+      return TRUE;
     default:
-      return 0;
+      return FALSE;
     }
 }
+#endif
 
 static gboolean
 xw_forward_event_from_view (GtkWidget *widget, GdkEvent *event,
@@ -207,22 +810,46 @@ xw_forward_event_from_view (GtkWidget *widget, GdkEvent *event,
 {
   struct xwidget_view *xv = user_data;
   struct xwidget *xw = XXWIDGET (xv->model);
-  GdkEvent *eventcopy;
-  bool translated_p;
 
   if (NILP (xw->buffer))
     return TRUE;
 
-  eventcopy = gdk_event_copy (event);
-  translated_p = xw_forward_event_translate (eventcopy, xv, xw);
-  record_osr_embedder (xv);
+  if (event->type == GDK_BUTTON_PRESS || event->type == GDK_SCROLL)
+    {
+      if (WINDOW_LIVE_P (xv->w) && !EQ (xv->w, selected_window))
+	Fselect_window (xv->w, Qnil);
+    }
 
-  g_object_ref (eventcopy->any.window);
-  if (translated_p)
-    gtk_main_do_event (eventcopy);
+  GdkEvent *eventcopy = gdk_event_copy (event);
+
+  switch (eventcopy->type)
+    {
+    case GDK_BUTTON_PRESS:
+    case GDK_BUTTON_RELEASE:
+    case GDK_2BUTTON_PRESS:
+    case GDK_3BUTTON_PRESS:
+      eventcopy->button.x += xv->clip_left;
+      eventcopy->button.y += xv->clip_top;
+      break;
+    case GDK_SCROLL:
+      eventcopy->scroll.x += xv->clip_left;
+      eventcopy->scroll.y += xv->clip_top;
+      break;
+    case GDK_MOTION_NOTIFY:
+      eventcopy->motion.x += xv->clip_left;
+      eventcopy->motion.y += xv->clip_top;
+      break;
+    case GDK_ENTER_NOTIFY:
+    case GDK_LEAVE_NOTIFY:
+      eventcopy->crossing.x += xv->clip_left;
+      eventcopy->crossing.y += xv->clip_top;
+      break;
+    default:
+      break;
+    }
+
+  xwidget_wpe_forward_event (eventcopy, xw);
   gdk_event_free (eventcopy);
-
-  /* Don't propagate this event further.  */
   return TRUE;
 }
 #endif
@@ -330,128 +957,197 @@ fails.  */)
   xw->widgetwindow_osr = NULL;
   xw->widget_osr = NULL;
   xw->hit_result = 0;
+#ifdef HAVE_WPE
+  xw->wpe_web_view = NULL;
+  xw->wpe_web_view_backend = NULL;
+  xw->wpe_exportable = NULL;
+  xw->wpe_backend = NULL;
+  xw->wpe_surface = NULL;
+  xw->wpe_surface_data = NULL;
+  xw->wpe_surface_size = 0;
+  xw->wpe_surface_width = 0;
+  xw->wpe_surface_height = 0;
+  xw->wpe_surface_stride = 0;
+  xw->wpe_egl_image = NULL;
+  xw->wpe_egl_width = 0;
+  xw->wpe_egl_height = 0;
+  xw->wpe_use_egl = false;
+  xw->wpe_frame_watchdog = NULL;
+  xw->wpe_frame_seen = false;
+  xw->wpe_logged_no_frame = false;
   if (EQ (xw->type, Qwebkit))
     {
-      block_input ();
-      WebKitSettings *settings;
-      WebKitWebContext *webkit_context = webkit_web_context_get_default ();
+#if WEBKIT_CHECK_VERSION(2, 40, 0)
+      WebKitNetworkSession *network_session = NULL;
+      bool network_session_unref = false;
+      WebKitWebView *related_view = NULL;
 
-# if WEBKIT_CHECK_VERSION (2, 26, 0)
-      if (!webkit_web_context_get_sandbox_enabled (webkit_context))
-	webkit_web_context_set_sandbox_enabled (webkit_context, TRUE);
-# endif
-
-      xw->widgetwindow_osr = gtk_offscreen_window_new ();
-      gtk_window_resize (GTK_WINDOW (xw->widgetwindow_osr), xw->width,
-                         xw->height);
-      gtk_container_check_resize (GTK_CONTAINER (xw->widgetwindow_osr));
-
-      if (EQ (xw->type, Qwebkit))
-        {
-	  WebKitWebView *related_view;
-
-	  if (NILP (related)
-	      || !XWIDGETP (related)
-	      || !EQ (XXWIDGET (related)->type, Qwebkit))
-	    {
-	      WebKitWebContext *ctx = webkit_web_context_new ();
-	      xw->widget_osr = webkit_web_view_new_with_context (ctx);
-	      g_object_unref (ctx);
-
-	      g_signal_connect (G_OBJECT (ctx),
-				"download-started",
-				G_CALLBACK (webkit_download_cb), xw);
-
-	      webkit_web_view_load_uri (WEBKIT_WEB_VIEW (xw->widget_osr),
-					"about:blank");
-	      /* webkitgtk uses GSubprocess which sets sigaction causing
-		 Emacs to not catch SIGCHLD with its usual handle setup in
-		 'catch_child_signal'.  This resets the SIGCHLD sigaction.  */
-	      catch_child_signal ();
-	    }
+#if WEBKIT_CHECK_VERSION(2, 28, 0)
+      if (!wpe_sandbox_paths_added)
+	{
+	  WebKitWebContext *default_ctx = webkit_web_context_get_default ();
+	  const char *paths_env = getenv ("XWIDGET_WPE_SANDBOX_PATHS");
+	  if (paths_env && paths_env[0])
+	    wpe_add_sandbox_paths_from_env (default_ctx, paths_env);
 	  else
 	    {
-	      related_view = WEBKIT_WEB_VIEW (XXWIDGET (related)->widget_osr);
-	      xw->widget_osr = webkit_web_view_new_with_related_view (related_view);
+	      /* NixOS stores helper binaries in /nix/store. */
+	      wpe_add_sandbox_path_if_exists (default_ctx, "/nix/store", TRUE);
+	      wpe_add_sandbox_path_if_exists (default_ctx,
+					      "/run/current-system/sw", TRUE);
+	      /* DBus proxy needs a writable runtime dir. */
+	      {
+		const char *runtime_dir = getenv ("XDG_RUNTIME_DIR");
+		if (runtime_dir && runtime_dir[0])
+		  wpe_add_sandbox_path_if_exists (default_ctx, runtime_dir,
+						  FALSE);
+	      }
 	    }
+	  wpe_sandbox_paths_added = true;
+	}
+#endif
 
-	  /* Enable the developer extras.  */
-	  settings = webkit_web_view_get_settings (WEBKIT_WEB_VIEW (xw->widget_osr));
-	  g_object_set (G_OBJECT (settings), "enable-developer-extras", TRUE, NULL);
-	  g_object_set (G_OBJECT (settings), "enable-javascript",
-		        (gboolean) (!xwidget_webkit_disable_javascript), NULL);
+      if (!NILP (related))
+	{
+	  CHECK_XWIDGET (related);
+	  if (XXWIDGET (related)->wpe_web_view)
+	    {
+	      related_view = XXWIDGET (related)->wpe_web_view;
+	      network_session =
+		webkit_web_view_get_network_session (related_view);
+	    }
 	}
 
-      gtk_widget_set_size_request (GTK_WIDGET (xw->widget_osr), xw->width,
-                                   xw->height);
-      gtk_widget_queue_allocate (GTK_WIDGET (xw->widget_osr));
+      if (!network_session)
+	network_session =
+	  wpe_network_session_from_emacs (&network_session_unref);
+#endif
+      block_input ();
+      WebKitSettings *settings;
+      WebKitWebContext *ctx;
+      bool use_egl = false;
+      bool disable_egl = false;
 
-      if (EQ (xw->type, Qwebkit))
-        {
-          gtk_container_add (GTK_CONTAINER (xw->widgetwindow_osr),
-                             GTK_WIDGET (WEBKIT_WEB_VIEW (xw->widget_osr)));
-        }
+#ifdef HAVE_EPOXY
+      {
+	const char *env = getenv ("XWIDGET_WPE_DISABLE_EGL");
+	if (env && *env && strcmp (env, "0") != 0)
+	  disable_egl = true;
+      }
+      if (!disable_egl)
+	use_egl = wpe_try_initialize_egl ();
+#endif
+      if (disable_egl)
+	wpe_debug ("WPE EGL disabled via XWIDGET_WPE_DISABLE_EGL");
+      wpe_debug ("WPE EGL available: %s", use_egl ? "yes" : "no");
+
+      if (!use_egl)
+	{
+	  unblock_input ();
+	  error ("WPE EGL unavailable (SHM support disabled)");
+	}
+
+#ifdef HAVE_EPOXY
+      xw->wpe_exportable = wpe_view_backend_exportable_fdo_egl_create
+	(&wpe_exportable_egl_client, xw, xw->width, xw->height);
+      if (xw->wpe_exportable)
+	{
+	  xw->wpe_use_egl = true;
+	  wpe_debug ("WPE exportable EGL backend created");
+	}
       else
-        {
-          gtk_container_add (GTK_CONTAINER (xw->widgetwindow_osr),
-                             xw->widget_osr);
-        }
-
-      gtk_widget_show (xw->widget_osr);
-      gtk_widget_show (xw->widgetwindow_osr);
-#if !defined HAVE_XINPUT2 && !defined HAVE_PGTK
-      synthesize_focus_in_event (xw->widgetwindow_osr);
+	{
+	  unblock_input ();
+	  error ("WPE exportable EGL backend creation failed");
+	}
 #endif
 
-      g_signal_connect (G_OBJECT (gtk_widget_get_window (xw->widgetwindow_osr)),
-			"from-embedder", G_CALLBACK (from_embedder), NULL);
-      g_signal_connect (G_OBJECT (gtk_widget_get_window (xw->widgetwindow_osr)),
-			"to-embedder", G_CALLBACK (to_embedder), NULL);
-      g_signal_connect (G_OBJECT (gtk_widget_get_window (xw->widgetwindow_osr)),
-			"pick-embedded-child", G_CALLBACK (pick_embedded_child), NULL);
+      xw->wpe_backend = wpe_view_backend_exportable_fdo_get_view_backend
+	(xw->wpe_exportable);
+      wpe_debug ("WPE view backend %s", xw->wpe_backend ? "ready" : "null");
+      wpe_view_backend_initialize (xw->wpe_backend);
+      wpe_debug ("WPE view backend initialized");
+      xw->wpe_web_view_backend = webkit_web_view_backend_new
+	(xw->wpe_backend, wpe_web_view_backend_noop_destroy, xw);
+      wpe_debug ("WebView backend %s",
+		 xw->wpe_web_view_backend ? "created" : "null");
+      if (!xw->wpe_web_view_backend)
+	{
+	  unblock_input ();
+	  error ("WPE WebView backend creation failed");
+	}
+#if WEBKIT_CHECK_VERSION(2, 40, 0)
+      if (related_view)
+	xw->wpe_web_view = g_object_new (WEBKIT_TYPE_WEB_VIEW,
+					 "backend", xw->wpe_web_view_backend,
+					 "related-view", related_view,
+					 NULL);
+      else
+	xw->wpe_web_view = g_object_new (WEBKIT_TYPE_WEB_VIEW,
+					 "backend", xw->wpe_web_view_backend,
+					 "network-session", network_session,
+					 NULL);
+      if (network_session_unref)
+	g_object_unref (network_session);
+#else
+      xw->wpe_web_view = webkit_web_view_new (xw->wpe_web_view_backend);
+#endif
+      wpe_debug ("WebView %s", xw->wpe_web_view ? "created" : "null");
+      if (!xw->wpe_web_view)
+	{
+	  unblock_input ();
+	  error ("WPE WebView creation failed");
+	}
+      if (G_IS_OBJECT (xw->wpe_web_view))
+	g_object_add_weak_pointer (G_OBJECT (xw->wpe_web_view),
+				   (gpointer *) &xw->wpe_web_view);
+      g_object_set_data (G_OBJECT (xw->wpe_web_view), XG_XWIDGET, xw);
 
-      /* Store some xwidget data in the gtk widgets for convenient
-         retrieval in the event handlers.  */
-      g_object_set_data (G_OBJECT (xw->widget_osr), XG_XWIDGET, xw);
-      g_object_set_data (G_OBJECT (xw->widgetwindow_osr), XG_XWIDGET, xw);
+      ctx = webkit_web_view_get_context (xw->wpe_web_view);
+      if (g_signal_lookup ("download-started", G_OBJECT_TYPE (ctx)) != 0)
+	g_signal_connect (G_OBJECT (ctx),
+			  "download-started",
+			  G_CALLBACK (webkit_download_cb), xw);
 
-      /* signals */
-      if (EQ (xw->type, Qwebkit))
-        {
-          g_signal_connect (G_OBJECT (xw->widget_osr),
-                            "load-changed",
-                            G_CALLBACK (webkit_view_load_changed_cb), xw);
+      settings = webkit_web_view_get_settings (xw->wpe_web_view);
+      g_object_set (G_OBJECT (settings), "enable-developer-extras", TRUE, NULL);
+      g_object_set (G_OBJECT (settings), "enable-javascript",
+		    (gboolean) (!xwidget_webkit_disable_javascript), NULL);
 
-          g_signal_connect (G_OBJECT (xw->widget_osr),
-                            "decide-policy",
-                            G_CALLBACK
-                            (webkit_decide_policy_cb),
-                            xw);
+      g_signal_connect (G_OBJECT (xw->wpe_web_view),
+			"load-changed",
+			G_CALLBACK (webkit_view_load_changed_cb), xw);
+      g_signal_connect (G_OBJECT (xw->wpe_web_view),
+			"decide-policy",
+			G_CALLBACK (webkit_decide_policy_cb), xw);
 #ifdef HAVE_PGTK
-	  g_signal_connect (G_OBJECT (xw->widget_osr),
-			    "mouse-target-changed",
-			    G_CALLBACK (mouse_target_changed),
-			    xw);
+      g_signal_connect (G_OBJECT (xw->wpe_web_view),
+			"mouse-target-changed",
+			G_CALLBACK (mouse_target_changed),
+			xw);
 #endif
-	  g_signal_connect (G_OBJECT (xw->widget_osr),
-			    "create",
-			    G_CALLBACK (webkit_create_cb),
-			    xw);
-	  g_signal_connect (G_OBJECT (xw->widget_osr),
-			    "script-dialog",
-			    G_CALLBACK (webkit_script_dialog_cb),
-			    NULL);
-	  g_signal_connect (G_OBJECT (xw->widget_osr),
-			    "run-file-chooser",
-			    G_CALLBACK (run_file_chooser_cb),
-			    NULL);
-        }
+      g_signal_connect (G_OBJECT (xw->wpe_web_view),
+			"create",
+			G_CALLBACK (webkit_create_cb), xw);
+      g_signal_connect (G_OBJECT (xw->wpe_web_view),
+			"script-dialog",
+			G_CALLBACK (webkit_script_dialog_cb), NULL);
+      g_signal_connect (G_OBJECT (xw->wpe_web_view),
+			"run-file-chooser",
+			G_CALLBACK (run_file_chooser_cb), NULL);
 
-      g_signal_connect (G_OBJECT (xw->widgetwindow_osr), "damage-event",
-			G_CALLBACK (offscreen_damage_event), xw);
+      webkit_web_view_load_uri (xw->wpe_web_view, "about:blank");
+
+      wpe_view_backend_dispatch_set_size (xw->wpe_backend, xw->width, xw->height);
+      wpe_view_backend_add_activity_state
+	(xw->wpe_backend,
+	 wpe_view_activity_state_visible | wpe_view_activity_state_in_window);
+
+      wpe_start_frame_watchdog (xw);
 
       unblock_input ();
     }
+#endif
 #elif defined NS_IMPL_COCOA
   nsxwidget_init (xw);
 #endif
@@ -469,17 +1165,6 @@ Value is nil if OBJECT is not an xwidget or if it has been killed.  */)
 	  ? Qt : Qnil);
 }
 
-#ifdef USE_GTK
-static void
-set_widget_if_text_view (GtkWidget *widget, void *data)
-{
-  GtkWidget **pointer = data;
-
-  if (GTK_IS_TEXT_VIEW (widget))
-    *pointer = widget;
-}
-#endif
-
 DEFUN ("xwidget-perform-lispy-event",
        Fxwidget_perform_lispy_event, Sxwidget_perform_lispy_event,
        2, 3, 0, doc: /* Send a lispy event to XWIDGET.
@@ -491,14 +1176,6 @@ selected frame is not an X-Windows frame.  */)
 {
 #ifdef USE_GTK
   struct frame *f = NULL;
-  GdkEvent *xg_event;
-  GtkContainerClass *klass;
-  GtkWidget *widget;
-  GtkWidget *temp = NULL;
-#ifdef HAVE_XINPUT2
-  GdkWindow *embedder;
-  GdkWindow *osw;
-#endif
 #endif
 
   CHECK_LIVE_XWIDGET (xwidget);
@@ -512,23 +1189,6 @@ selected frame is not an X-Windows frame.  */)
   int character = -1, keycode = -1;
   int modifiers = 0;
   struct xwidget *xw = XXWIDGET (xwidget);
-
-#ifdef HAVE_XINPUT2
-  /* XI2 GDK devices crash if we try this without an embedder set.  */
-  if (!f)
-    return Qnil;
-
-  block_input ();
-  osw = gtk_widget_get_window (xw->widgetwindow_osr);
-  embedder = gtk_widget_get_window (FRAME_GTK_OUTER_WIDGET (f));
-
-  gdk_offscreen_window_set_embedder (osw, embedder);
-  unblock_input ();
-#endif	/* HAVE_XINPUT2 */
-  widget = gtk_window_get_focus (GTK_WINDOW (xw->widgetwindow_osr));
-
-  if (!widget)
-    widget = xw->widget_osr;
 
   if (RANGED_FIXNUMP (0, event, INT_MAX))
     {
@@ -599,74 +1259,38 @@ selected frame is not an X-Windows frame.  */)
     }
 
   if (character == -1 && keycode == -1)
+    return Qnil;
+
+  if (xw->wpe_backend)
     {
-#ifdef HAVE_XINPUT2
-      block_input ();
-      if (xw->embedder_view)
-	record_osr_embedder (xw->embedder_view);
-      else
-	gdk_offscreen_window_set_embedder (osw, NULL);
-      unblock_input ();
-#endif	/* HAVE_XINPUT2 */
+      struct wpe_input_keyboard_event ke = {0};
+      uint32_t mods = wpe_modifiers_from_gdk (modifiers);
+      uint32_t code = 0;
+
+      if (character > -1)
+	code = wpe_unicode_to_key_code (character);
+      else if (keycode > -1)
+	{
+	  gunichar unicode = gdk_keyval_to_unicode (keycode);
+	  if (unicode)
+	    code = wpe_unicode_to_key_code (unicode);
+	  else
+	    code = keycode;
+	}
+
+      if (!code)
+	return Qnil;
+
+      ke.time = 0;
+      ke.key_code = code;
+      ke.hardware_key_code = code;
+      ke.modifiers = mods;
+      ke.pressed = true;
+      wpe_view_backend_dispatch_keyboard_event (xw->wpe_backend, &ke);
+      ke.pressed = false;
+      wpe_view_backend_dispatch_keyboard_event (xw->wpe_backend, &ke);
       return Qnil;
     }
-
-  block_input ();
-  xg_event = gdk_event_new (GDK_KEY_PRESS);
-  xg_event->any.window = gtk_widget_get_window (xw->widget_osr);
-  g_object_ref (xg_event->any.window);
-
-  if (character > -1)
-    keycode = gdk_unicode_to_keyval (character);
-
-  xg_event->key.keyval = keycode;
-#ifndef HAVE_X_WINDOWS
-  xg_event->key.state = modifiers;
-#else
-  if (f)
-    xg_event->key.state = xw_translate_x_modifiers (FRAME_DISPLAY_INFO (f),
-						    modifiers);
-#endif	/* !HAVE_X_WINDOWS */
-
-  if (keycode > -1)
-    {
-      /* WebKitGTK internals abuse follows.  */
-      if (WEBKIT_IS_WEB_VIEW (widget))
-	{
-	  /* WebKitGTK relies on an internal GtkTextView object to
-	     "translate" keys such as backspace.  We must find that
-	     widget and activate its binding to this key if any.  */
-	  klass = GTK_CONTAINER_CLASS (G_OBJECT_GET_CLASS (widget));
-
-	  klass->forall (GTK_CONTAINER (xw->widget_osr), TRUE,
-			 set_widget_if_text_view, &temp);
-
-	  if (GTK_IS_WIDGET (temp))
-	    {
-	      if (!gtk_widget_get_realized (temp))
-		gtk_widget_realize (temp);
-
-	      gtk_bindings_activate (G_OBJECT (temp), keycode, modifiers);
-	    }
-	}
-    }
-
-  if (f)
-    gdk_event_set_device (xg_event,
-			  find_suitable_keyboard (SELECTED_FRAME ()));
-
-  gtk_main_do_event (xg_event);
-  xg_event->type = GDK_KEY_RELEASE;
-  gtk_main_do_event (xg_event);
-  gdk_event_free (xg_event);
-
-#ifdef HAVE_XINPUT2
-  if (xw->embedder_view)
-    record_osr_embedder (xw->embedder_view);
-  else
-    gdk_offscreen_window_set_embedder (osw, NULL);
-#endif	/* HAVE_XINPUT2 */
-  unblock_input ();
 #endif	/* USE_GTK */
 
   return Qnil;
@@ -716,32 +1340,6 @@ xwidget_from_id (uint32_t id)
 }
 
 #ifdef USE_GTK
-static GdkWindow *
-pick_embedded_child (GdkWindow *window, double x, double y,
-		     gpointer user_data)
-{
-  GtkWidget *widget;
-  GtkWidget *child;
-  GdkEvent event;
-  int xout, yout;
-
-  event.any.window = window;
-  event.any.type = GDK_NOTHING;
-
-  widget = gtk_get_event_widget (&event);
-
-  if (!widget)
-    return NULL;
-
-  child = find_widget_at_pos (widget, lrint (x), lrint (y),
-			      &xout, &yout, false, NULL);
-
-  if (!child)
-    return NULL;
-
-  return gtk_widget_get_window (child);
-}
-
 static void
 record_osr_embedder (struct xwidget_view *view)
 {
@@ -749,111 +1347,25 @@ record_osr_embedder (struct xwidget_view *view)
   GdkWindow *window, *embedder;
 
   xw = XXWIDGET (view->model);
+  if (!xw->widgetwindow_osr || !GTK_IS_WIDGET (xw->widgetwindow_osr))
+    return;
   window = gtk_widget_get_window (xw->widgetwindow_osr);
+#ifndef HAVE_PGTK
+  if (!FRAME_GTK_OUTER_WIDGET (view->frame))
+    return;
+#endif
 #ifndef HAVE_PGTK
   embedder = gtk_widget_get_window (FRAME_GTK_OUTER_WIDGET (view->frame));
 #else
+  if (!view->widget || !GTK_IS_WIDGET (view->widget))
+    return;
   embedder = gtk_widget_get_window (view->widget);
 #endif
+  if (!window || !embedder)
+    return;
   gdk_offscreen_window_set_embedder (window, embedder);
   xw->embedder = view->frame;
   xw->embedder_view = view;
-}
-
-static struct xwidget *
-find_xwidget_for_offscreen_window (GdkWindow *window)
-{
-  Lisp_Object tem;
-  struct xwidget *xw;
-  GdkWindow *w;
-
-  for (tem = internal_xwidget_list; CONSP (tem); tem = XCDR (tem))
-    {
-      if (XWIDGETP (XCAR (tem)))
-	{
-	  xw = XXWIDGET (XCAR (tem));
-	  w = gtk_widget_get_window (xw->widgetwindow_osr);
-
-	  if (w == window)
-	    return xw;
-	}
-    }
-
-  return NULL;
-}
-
-static void
-from_embedder (GdkWindow *window, double x, double y,
-	       gpointer x_out_ptr, gpointer y_out_ptr,
-	       gpointer user_data)
-{
-  double *xout = x_out_ptr;
-  double *yout = y_out_ptr;
-#ifndef HAVE_PGTK
-  struct xwidget *xw = find_xwidget_for_offscreen_window (window);
-  struct xwidget_view *xvw;
-  gint xoff, yoff;
-
-  if (!xw)
-    emacs_abort ();
-
-  xvw = xw->embedder_view;
-
-  if (!xvw)
-    {
-      *xout = x;
-      *yout = y;
-    }
-  else
-    {
-      gtk_widget_translate_coordinates (FRAME_GTK_WIDGET (xvw->frame),
-					FRAME_GTK_OUTER_WIDGET (xvw->frame),
-					0, 0, &xoff, &yoff);
-
-      *xout = x - xvw->x - xoff;
-      *yout = y - xvw->y - yoff;
-    }
-#else
-  *xout = x;
-  *yout = y;
-#endif
-}
-
-static void
-to_embedder (GdkWindow *window, double x, double y,
-	     gpointer x_out_ptr, gpointer y_out_ptr,
-	     gpointer user_data)
-{
-  double *xout = x_out_ptr;
-  double *yout = y_out_ptr;
-#ifndef HAVE_PGTK
-  struct xwidget *xw = find_xwidget_for_offscreen_window (window);
-  struct xwidget_view *xvw;
-  gint xoff, yoff;
-
-  if (!xw)
-    emacs_abort ();
-
-  xvw = xw->embedder_view;
-
-  if (!xvw)
-    {
-      *xout = x;
-      *yout = y;
-    }
-  else
-    {
-      gtk_widget_translate_coordinates (FRAME_GTK_WIDGET (xvw->frame),
-					FRAME_GTK_OUTER_WIDGET (xvw->frame),
-					0, 0, &xoff, &yoff);
-
-      *xout = x + xvw->x + xoff;
-      *yout = y + xvw->y + yoff;
-    }
-#else
-  *xout = x;
-  *yout = y;
-#endif
 }
 
 static GdkDevice *
@@ -885,18 +1397,6 @@ find_suitable_pointer (struct frame *f, bool need_smooth)
   g_list_free (devices);
 
   return !tem ? gdk_seat_get_pointer (seat) : device;
-}
-
-static GdkDevice *
-find_suitable_keyboard (struct frame *f)
-{
-  GdkSeat *seat = gdk_display_get_default_seat
-    (gtk_widget_get_display (FRAME_GTK_WIDGET (f)));
-
-  if (!seat)
-    return NULL;
-
-  return gdk_seat_get_keyboard (seat);
 }
 
 static void
@@ -1123,12 +1623,24 @@ run_file_chooser_cb (WebKitWebView *webview,
 					 GTK_WINDOW (FRAME_GTK_OUTER_WIDGET (f)),
 					 GTK_FILE_CHOOSER_ACTION_OPEN, "Select",
 					 "Cancel");
-  filter = webkit_file_chooser_request_get_mime_types_filter (request);
+  filter = NULL;
+  const gchar * const *mime_types =
+    webkit_file_chooser_request_get_mime_types (request);
+  if (mime_types && mime_types[0])
+    {
+      filter = gtk_file_filter_new ();
+      for (const gchar * const *mime = mime_types; *mime; ++mime)
+	gtk_file_filter_add_mime_type (filter, *mime);
+    }
   select_multiple_p = webkit_file_chooser_request_get_select_multiple (request);
 
   gtk_file_chooser_set_select_multiple (GTK_FILE_CHOOSER (chooser),
 					select_multiple_p);
-  gtk_file_chooser_add_filter (GTK_FILE_CHOOSER (chooser), filter);
+  if (filter)
+    {
+      gtk_file_chooser_add_filter (GTK_FILE_CHOOSER (chooser), filter);
+      g_object_unref (filter);
+    }
   response = gtk_native_dialog_run (GTK_NATIVE_DIALOG (chooser));
 
   if (response != GTK_RESPONSE_ACCEPT)
@@ -1758,15 +2270,6 @@ xw_maybe_synthesize_crossing (struct xwidget_view *view,
   bool nonlinear_p;
   bool retention_flag;
 
-#if WEBKIT_CHECK_VERSION (2, 34, 0)
-  /* Work around a silly bug in WebKitGTK+ that tries to make tooltip
-     windows transient for our offscreen window.  */
-  int tooltip_width, tooltip_height;
-
-  xg_prepare_tooltip (view->frame, dummy_tooltip_string,
-		      &tooltip_width, &tooltip_height);
-#endif
-
   toplevel = gtk_widget_get_window (XXWIDGET (view->model)->widgetwindow_osr);
   retention_flag = false;
 
@@ -2085,32 +2588,6 @@ xwidget_motion_or_crossing (struct xwidget_view *view, const XEvent *event)
 
 #endif /* HAVE_X_WINDOWS */
 
-static void
-synthesize_focus_in_event (GtkWidget *offscreen_window)
-{
-  GdkWindow *wnd;
-  GdkEvent *focus_event;
-
-  if (!gtk_widget_get_realized (offscreen_window))
-    gtk_widget_realize (offscreen_window);
-
-  wnd = gtk_widget_get_window (offscreen_window);
-
-  focus_event = gdk_event_new (GDK_FOCUS_CHANGE);
-  focus_event->focus_change.window = wnd;
-  focus_event->focus_change.in = TRUE;
-
-  if (FRAME_WINDOW_P (SELECTED_FRAME ()))
-    gdk_event_set_device (focus_event,
-			  find_suitable_pointer (SELECTED_FRAME (),
-						 false));
-
-  g_object_ref (wnd);
-
-  gtk_main_do_event (focus_event);
-  gdk_event_free (focus_event);
-}
-
 #ifdef HAVE_X_WINDOWS
 struct xwidget_view *
 xwidget_view_from_window (Window wdesc)
@@ -2189,19 +2666,200 @@ xv_do_draw (struct xwidget_view *xw, struct xwidget *w)
   unblock_input ();
 }
 #else
+#ifdef HAVE_WPE
+#ifdef HAVE_EPOXY
+static bool
+xwidget_view_prepare_gl (struct xwidget_view *view)
+{
+  if (view->wpe_gl_context)
+    return view->wpe_gl_import_ready;
+
+  if (!view->widget)
+    return false;
+
+  GdkWindow *window = gtk_widget_get_window (view->widget);
+  if (!window)
+    return false;
+
+  GError *error = NULL;
+  view->wpe_gl_context = gdk_window_create_gl_context (window, &error);
+  if (!view->wpe_gl_context)
+    {
+      if (error)
+	g_error_free (error);
+      return false;
+    }
+
+  gdk_gl_context_make_current (view->wpe_gl_context);
+  view->wpe_gl_import_ready = epoxy_has_gl_extension ("GL_OES_EGL_image");
+  if (!view->wpe_gl_import_ready)
+    {
+      g_clear_object (&view->wpe_gl_context);
+      return false;
+    }
+
+  return true;
+}
+
+static bool
+xwidget_view_draw_wpe_egl (struct xwidget_view *view, struct xwidget *w,
+			   cairo_t *cr)
+{
+  int wpe_egl_flip_x = 0;
+  int wpe_egl_flip_y = 0;
+
+  if (!w->wpe_use_egl || !w->wpe_egl_image)
+    return false;
+
+  if (w->wpe_egl_width <= 0 || w->wpe_egl_height <= 0)
+    {
+      wpe_debug_once (&wpe_logged_egl_fail_size,
+		      "EGL draw fallback: invalid size %dx%d",
+		      w->wpe_egl_width, w->wpe_egl_height);
+      return false;
+    }
+
+  if (!xwidget_view_prepare_gl (view))
+    {
+      wpe_debug_once (&wpe_logged_egl_fail_gl,
+		      "EGL draw fallback: GL context not ready");
+      return false;
+    }
+
+  GdkWindow *window = gtk_widget_get_window (view->widget);
+  if (!window)
+    {
+      wpe_debug_once (&wpe_logged_egl_fail_window,
+		      "EGL draw fallback: no GdkWindow");
+      return false;
+    }
+
+  gdk_gl_context_make_current (view->wpe_gl_context);
+
+  if (view->wpe_last_egl_image != w->wpe_egl_image)
+    {
+      if (view->wpe_gl_texture)
+	{
+	  GLuint tex = view->wpe_gl_texture;
+	  glDeleteTextures (1, &tex);
+	  view->wpe_gl_texture = 0;
+	}
+
+      GLuint tex = 0;
+      glGenTextures (1, &tex);
+      glBindTexture (GL_TEXTURE_2D, tex);
+      glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+      glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+      glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+      glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+      EGLImageKHR egl_image =
+	wpe_fdo_egl_exported_image_get_egl_image (w->wpe_egl_image);
+      glEGLImageTargetTexture2DOES (GL_TEXTURE_2D, egl_image);
+
+      view->wpe_gl_texture = tex;
+      view->wpe_last_egl_image = w->wpe_egl_image;
+    }
+
+  int scale = gdk_window_get_scale_factor (window);
+  int alloc_width = gtk_widget_get_allocated_width (view->widget);
+  int alloc_height = gtk_widget_get_allocated_height (view->widget);
+  int desired_width = (alloc_width > 0 ? alloc_width * scale : 0);
+  int desired_height = (alloc_height > 0 ? alloc_height * scale : 0);
+  if (w->wpe_web_view && scale > 1)
+    {
+      /* Apply HiDPI scaling once if no user zoom has been set. */
+      double zoom = webkit_web_view_get_zoom_level (w->wpe_web_view);
+      if (zoom == 1.0)
+	webkit_web_view_set_zoom_level (w->wpe_web_view, (double) scale);
+    }
+  if (w->wpe_backend && desired_width > 0 && desired_height > 0
+      && (w->wpe_egl_width != desired_width
+	  || w->wpe_egl_height != desired_height))
+    {
+      /* Keep WPE EGL buffer sized to the widget in device pixels. */
+      wpe_view_backend_dispatch_set_size (w->wpe_backend,
+					  desired_width, desired_height);
+    }
+  int buffer_scale = scale;
+  if (alloc_width > 0 && alloc_height > 0)
+    {
+      int expected_device_width = alloc_width * scale;
+      int expected_device_height = alloc_height * scale;
+      int expected_logical_width = alloc_width;
+      int expected_logical_height = alloc_height;
+
+      /* Prefer device pixel sizing; only fall back to logical sizing
+	 when the EGL image exactly matches the logical dimensions. */
+      if (w->wpe_egl_width == expected_logical_width
+	  && w->wpe_egl_height == expected_logical_height)
+	buffer_scale = 1;
+      else
+	buffer_scale = scale;
+    }
+
+  cairo_save (cr);
+  cairo_translate (cr, -view->clip_left, -view->clip_top);
+  wpe_get_egl_flip_flags (&wpe_egl_flip_x, &wpe_egl_flip_y);
+  double flip_width = w->wpe_egl_width;
+  double flip_height = w->wpe_egl_height;
+  if (buffer_scale > 1)
+    {
+      flip_width /= buffer_scale;
+      flip_height /= buffer_scale;
+    }
+  if (wpe_egl_flip_x)
+    {
+      cairo_translate (cr, flip_width, 0);
+      cairo_scale (cr, -1, 1);
+    }
+  if (wpe_egl_flip_y)
+    {
+      cairo_translate (cr, 0, flip_height);
+      cairo_scale (cr, 1, -1);
+    }
+  gdk_cairo_draw_from_gl (cr, window, view->wpe_gl_texture,
+			  GL_TEXTURE, buffer_scale, 0, 0,
+			  w->wpe_egl_width, w->wpe_egl_height);
+  cairo_restore (cr);
+  glFlush ();
+
+  wpe_debug_once (&wpe_logged_egl_draw,
+		  "EGL draw path active (%dx%d)",
+		  w->wpe_egl_width, w->wpe_egl_height);
+  return true;
+}
+#endif
+#endif
+
 static void
 xwidget_view_draw_cb (GtkWidget *widget, cairo_t *cr,
 		      gpointer data)
 {
   struct xwidget_view *view = data;
   struct xwidget *w = XXWIDGET (view->model);
-  GtkOffscreenWindow *wnd;
-  cairo_surface_t *surface;
 
   if (NILP (w->buffer))
     return;
 
   block_input ();
+#ifdef HAVE_WPE
+#ifdef HAVE_EPOXY
+  if (w->wpe_use_egl && w->wpe_egl_image)
+    {
+      if (xwidget_view_draw_wpe_egl (view, w, cr))
+	{
+	  unblock_input ();
+	  return;
+	}
+    }
+#endif
+  unblock_input ();
+  return;
+#else
+  GtkOffscreenWindow *wnd;
+  cairo_surface_t *surface;
+
   wnd = GTK_OFFSCREEN_WINDOW (w->widgetwindow_osr);
   surface = gtk_offscreen_window_get_surface (wnd);
 
@@ -2215,38 +2873,11 @@ xwidget_view_draw_cb (GtkWidget *widget, cairo_t *cr,
       cairo_paint (cr);
     }
   cairo_restore (cr);
+#endif
 
   unblock_input ();
 }
 #endif
-
-/* When the off-screen webkit master view changes this signal is called.
-   It copies the bitmap from the off-screen instance.  */
-static gboolean
-offscreen_damage_event (GtkWidget *widget, GdkEvent *event,
-                        gpointer xwidget)
-{
-  block_input ();
-
-  for (Lisp_Object tail = internal_xwidget_view_list; CONSP (tail);
-       tail = XCDR (tail))
-    {
-      if (XWIDGET_VIEW_P (XCAR (tail)))
-	{
-	  struct xwidget_view *view = XXWIDGET_VIEW (XCAR (tail));
-#ifdef HAVE_X_WINDOWS
-	  if (view->wdesc && XXWIDGET (view->model) == xwidget)
-	    xv_do_draw (view, XXWIDGET (view->model));
-#else
-	  gtk_widget_queue_draw (view->widget);
-#endif
-	}
-    }
-
-  unblock_input ();
-
-  return FALSE;
-}
 
 #ifdef HAVE_X_WINDOWS
 void
@@ -2326,80 +2957,32 @@ store_xwidget_display_event (struct xwidget *xw,
   kbd_buffer_store_event (&evt);
 }
 
-static void
-webkit_ready_to_show (WebKitWebView *new_view,
-		      gpointer user_data)
+static WebKitWebView *
+webkit_create_cb (WebKitWebView *webview,
+		  WebKitNavigationAction *nav_action,
+		  gpointer user_data)
 {
-  Lisp_Object tem;
-  struct xwidget *xw;
-  struct xwidget *src;
-
-  src = find_xwidget_for_offscreen_window (GDK_WINDOW (user_data));
-
-  for (tem = internal_xwidget_list; CONSP (tem); tem = XCDR (tem))
-    {
-      if (XWIDGETP (XCAR (tem)))
-	{
-	  xw = XXWIDGET (XCAR (tem));
-
-	  if (EQ (xw->type, Qwebkit)
-	      && WEBKIT_WEB_VIEW (xw->widget_osr) == new_view)
-	    {
-	      /* The source widget was destroyed before we had a
-		 chance to display the new widget.  */
-	      if (!src)
-		kill_xwidget (xw);
-	      else
-		store_xwidget_display_event (xw, src);
-	    }
-	}
-    }
-}
-
-static GtkWidget *
-webkit_create_cb_1 (WebKitWebView *webview,
-		    struct xwidget *xv)
-{
+  struct xwidget *src = user_data;
   Lisp_Object related;
   Lisp_Object xwidget;
-  GtkWidget *widget;
 
-  XSETXWIDGET (related, xv);
-  xwidget = Fmake_xwidget (Qwebkit, Qnil, make_fixnum (0),
-			   make_fixnum (0), Qnil,
+  if (webkit_navigation_action_get_navigation_type (nav_action)
+      != WEBKIT_NAVIGATION_TYPE_OTHER)
+    return NULL;
+
+  XSETXWIDGET (related, src);
+  xwidget = Fmake_xwidget (Qwebkit, Qnil,
+			   make_fixnum (src->width),
+			   make_fixnum (src->height),
+			   Qnil,
 			   build_string (" *detached xwidget buffer*"),
 			   related);
 
   if (NILP (xwidget))
     return NULL;
 
-  widget = XXWIDGET (xwidget)->widget_osr;
-
-  g_signal_connect (G_OBJECT (widget), "ready-to-show",
-		    G_CALLBACK (webkit_ready_to_show),
-		    gtk_widget_get_window (xv->widgetwindow_osr));
-
-  return widget;
-}
-
-static GtkWidget *
-webkit_create_cb (WebKitWebView *webview,
-		  WebKitNavigationAction *nav_action,
-		  gpointer user_data)
-{
-  switch (webkit_navigation_action_get_navigation_type (nav_action))
-    {
-    case WEBKIT_NAVIGATION_TYPE_OTHER:
-      return webkit_create_cb_1 (webview, user_data);
-
-    case WEBKIT_NAVIGATION_TYPE_BACK_FORWARD:
-    case WEBKIT_NAVIGATION_TYPE_RELOAD:
-    case WEBKIT_NAVIGATION_TYPE_FORM_SUBMITTED:
-    case WEBKIT_NAVIGATION_TYPE_FORM_RESUBMITTED:
-    case WEBKIT_NAVIGATION_TYPE_LINK_CLICKED:
-    default:
-      return NULL;
-    }
+  store_xwidget_display_event (XXWIDGET (xwidget), src);
+  return XXWIDGET (xwidget)->wpe_web_view;
 }
 
 void
@@ -2509,11 +3092,10 @@ webkit_javascript_finished_cb (GObject      *webview,
   if (!NILP (script_callback))
     xfree (xmint_pointer (XCAR (script_callback)));
 
-  WebKitJavascriptResult *js_result =
-    webkit_web_view_run_javascript_finish
+  JSCValue *value = webkit_web_view_evaluate_javascript_finish
     (WEBKIT_WEB_VIEW (webview), result, &error);
 
-  if (!js_result)
+  if (!value)
     {
       if (error)
 	g_error_free (error);
@@ -2522,8 +3104,6 @@ webkit_javascript_finished_cb (GObject      *webview,
 
   if (!NILP (script_callback) && !NILP (XCDR (script_callback)))
     {
-      JSCValue *value = webkit_javascript_result_get_js_value (js_result);
-
       Lisp_Object lisp_value = webkit_js_to_lisp (value);
 
       /* Register an xwidget event here, which then runs the callback.
@@ -2532,7 +3112,7 @@ webkit_javascript_finished_cb (GObject      *webview,
       store_xwidget_js_callback_event (xw, XCDR (script_callback), lisp_value);
     }
 
-  webkit_javascript_result_unref (js_result);
+  g_object_unref (value);
 }
 
 
@@ -2588,15 +3168,16 @@ webkit_decide_policy_cb (WebKitWebView *webView,
 
       XSETXWIDGET (val, xw);
 
-      new_xwidget = Fmake_xwidget (Qwebkit, Qnil, make_fixnum (0),
-				   make_fixnum (0), Qnil,
+      new_xwidget = Fmake_xwidget (Qwebkit, Qnil,
+				   make_fixnum (xw->width),
+				   make_fixnum (xw->height), Qnil,
 				   build_string (" *detached xwidget buffer*"),
 				   val);
 
       if (NILP (new_xwidget))
 	return FALSE;
 
-      newview = WEBKIT_WEB_VIEW (XXWIDGET (new_xwidget)->widget_osr);
+      newview = XWIDGET_WEBKIT_VIEW (XXWIDGET (new_xwidget));
       webkit_web_view_load_request (newview, request);
 
       store_xwidget_display_event (XXWIDGET (new_xwidget), xw);
@@ -2748,6 +3329,13 @@ xwidget_init_view (struct xwidget *xww,
 		    G_CALLBACK (xw_forward_event_from_view), xv);
 
   g_object_set_data (G_OBJECT (xv->widget), XG_XWIDGET_VIEW, xv);
+
+#ifdef HAVE_WPE
+  xv->wpe_gl_context = NULL;
+  xv->wpe_gl_texture = 0;
+  xv->wpe_last_egl_image = NULL;
+  xv->wpe_gl_import_ready = false;
+#endif
 
   xv->x = x;
   xv->y = y;
@@ -2991,7 +3579,8 @@ x_draw_xwidget_glyph_string (struct glyph_string *s)
       if (!xwidget_hidden (xv))
 	{
 #ifdef USE_GTK
-	  gtk_widget_queue_draw (xww->widget_osr);
+	  if (xv->widget && GTK_IS_WIDGET (xv->widget))
+	    gtk_widget_queue_draw (xv->widget);
 #elif defined NS_IMPL_COCOA
 	  nsxwidget_set_needsdisplay (xv);
 #endif
@@ -3002,14 +3591,6 @@ x_draw_xwidget_glyph_string (struct glyph_string *s)
     {
       XSetWindowBackground (xv->dpy, xv->wdesc,
 			    FRAME_BACKGROUND_PIXEL (s->f));
-    }
-#endif
-
-#if defined HAVE_XINPUT2 || defined HAVE_PGTK
-  if (!NILP (xww->buffer))
-    {
-      record_osr_embedder (xv);
-      synthesize_focus_in_event (xww->widget_osr);
     }
 #endif
 
@@ -3036,7 +3617,7 @@ DEFUN ("xwidget-webkit-uri",
 {
   WEBKIT_FN_INIT ();
 #ifdef USE_GTK
-  WebKitWebView *wkwv = WEBKIT_WEB_VIEW (xw->widget_osr);
+  WebKitWebView *wkwv = XWIDGET_WEBKIT_VIEW (xw);
   const gchar *uri = webkit_web_view_get_uri (wkwv);
   if (!uri)
     return build_string ("");
@@ -3054,7 +3635,7 @@ DEFUN ("xwidget-webkit-title",
 {
   WEBKIT_FN_INIT ();
 #ifdef USE_GTK
-  WebKitWebView *wkwv = WEBKIT_WEB_VIEW (xw->widget_osr);
+  WebKitWebView *wkwv = XWIDGET_WEBKIT_VIEW (xw);
   const gchar *title = webkit_web_view_get_title (wkwv);
 
   return build_string (title ? title : "");
@@ -3082,7 +3663,7 @@ is to completely loading its page.  */)
 
   block_input ();
 #ifdef USE_GTK
-  webview = WEBKIT_WEB_VIEW (xw->widget_osr);
+  webview = XWIDGET_WEBKIT_VIEW (xw);
   value = webkit_web_view_get_estimated_load_progress (webview);
 #elif defined NS_IMPL_COCOA
   value = nsxwidget_webkit_estimated_load_progress (xw);
@@ -3103,7 +3684,7 @@ DEFUN ("xwidget-webkit-goto-uri",
   CHECK_STRING (uri);
   uri = ENCODE_FILE (uri);
 #ifdef USE_GTK
-  webkit_web_view_load_uri (WEBKIT_WEB_VIEW (xw->widget_osr), SSDATA (uri));
+  webkit_web_view_load_uri (XWIDGET_WEBKIT_VIEW (xw), SSDATA (uri));
   catch_child_signal ();
 #elif defined NS_IMPL_COCOA
   nsxwidget_webkit_goto_uri (xw, SSDATA (uri));
@@ -3125,7 +3706,7 @@ REL-POSth element around the current spot in the load history. */)
   CHECK_FIXNUM (rel_pos);
 
 #ifdef USE_GTK
-  WebKitWebView *wkwv = WEBKIT_WEB_VIEW (xw->widget_osr);
+  WebKitWebView *wkwv = XWIDGET_WEBKIT_VIEW (xw);
   WebKitBackForwardList *list;
   WebKitBackForwardListItem *it;
 
@@ -3159,9 +3740,9 @@ DEFUN ("xwidget-webkit-zoom",
       double zoom_change = XFLOAT_DATA (factor);
 #ifdef USE_GTK
       webkit_web_view_set_zoom_level
-        (WEBKIT_WEB_VIEW (xw->widget_osr),
+        (XWIDGET_WEBKIT_VIEW (xw),
          webkit_web_view_get_zoom_level
-         (WEBKIT_WEB_VIEW (xw->widget_osr)) + zoom_change);
+         (XWIDGET_WEBKIT_VIEW (xw)) + zoom_change);
 #elif defined NS_IMPL_COCOA
       nsxwidget_webkit_zoom (xw, zoom_change);
 #endif
@@ -3217,11 +3798,12 @@ argument procedure FUN.*/)
      procedure that retrieves the return value.  */
   gchar *script_string
     = xmint_pointer (XCAR (AREF (xw->script_callbacks, idx)));
-  webkit_web_view_run_javascript (WEBKIT_WEB_VIEW (xw->widget_osr),
-				  script_string,
-                                  NULL, /* cancelable */
-                                  webkit_javascript_finished_cb,
-				  (gpointer) idx);
+  webkit_web_view_evaluate_javascript (XWIDGET_WEBKIT_VIEW (xw),
+				       script_string, -1,
+				       NULL, NULL,
+				       NULL, /* cancelable */
+				       webkit_javascript_finished_cb,
+				       (gpointer) idx);
 #elif defined NS_IMPL_COCOA
   nsxwidget_webkit_execute_script (xw, SSDATA (script), fun);
 #endif
@@ -3264,15 +3846,8 @@ DEFUN ("xwidget-resize", Fxwidget_resize, Sxwidget_resize, 3, 3, 0,
 
   /* If there is an offscreen widget resize it first.  */
 #ifdef USE_GTK
-  if (xw->widget_osr)
-    {
-      gtk_window_resize (GTK_WINDOW (xw->widgetwindow_osr), xw->width,
-                         xw->height);
-      gtk_widget_set_size_request (GTK_WIDGET (xw->widget_osr), xw->width,
-                                   xw->height);
-
-      gtk_widget_queue_allocate (GTK_WIDGET (xw->widget_osr));
-    }
+  if (xw->wpe_backend)
+    wpe_view_backend_dispatch_set_size (xw->wpe_backend, xw->width, xw->height);
 #elif defined NS_IMPL_COCOA
   nsxwidget_resize (xw);
 #endif
@@ -3294,9 +3869,8 @@ Emacs allocated area accordingly.  */)
 {
   CHECK_LIVE_XWIDGET (xwidget);
 #ifdef USE_GTK
-  GtkRequisition requisition;
-  gtk_widget_size_request (XXWIDGET (xwidget)->widget_osr, &requisition);
-  return list2i (requisition.width, requisition.height);
+  struct xwidget *xw = XXWIDGET (xwidget);
+  return list2i (xw->width, xw->height);
 #elif defined NS_IMPL_COCOA
   return nsxwidget_get_size (XXWIDGET (xwidget));
 #endif
@@ -3406,7 +3980,25 @@ DEFUN ("delete-xwidget-view",
     }
 
 #else
+#ifdef HAVE_WPE
+  if (xv->wpe_gl_context)
+    {
+#ifdef HAVE_EPOXY
+      gdk_gl_context_make_current (xv->wpe_gl_context);
+      if (xv->wpe_gl_texture)
+	{
+	  GLuint tex = xv->wpe_gl_texture;
+	  glDeleteTextures (1, &tex);
+	  xv->wpe_gl_texture = 0;
+	}
+#endif
+      g_clear_object (&xv->wpe_gl_context);
+    }
+  xv->wpe_last_egl_image = NULL;
+  xv->wpe_gl_import_ready = false;
+#endif
   gtk_widget_destroy (xv->widget);
+  xv->widget = NULL;
 #endif
 
   if (xw->embedder_view == xv && !NILP (xw->buffer))
@@ -3560,7 +4152,7 @@ with QUERY.  */)
   xw = XXWIDGET (xwidget);
   CHECK_WEBKIT_WIDGET (xw);
 
-  webview = WEBKIT_WEB_VIEW (xw->widget_osr);
+  webview = XWIDGET_WEBKIT_VIEW (xw);
   query = ENCODE_UTF_8 (query);
   opt = WEBKIT_FIND_OPTIONS_NONE;
   g_query = xstrdup (SSDATA (query));
@@ -3609,7 +4201,7 @@ using `xwidget-webkit-search'.  */)
 
 #ifdef USE_GTK
   block_input ();
-  webview = WEBKIT_WEB_VIEW (xw->widget_osr);
+  webview = XWIDGET_WEBKIT_VIEW (xw);
   controller = webkit_web_view_get_find_controller (webview);
   webkit_find_controller_search_next (controller);
   unblock_input ();
@@ -3642,7 +4234,7 @@ using `xwidget-webkit-search'.  */)
 
 #ifdef USE_GTK
   block_input ();
-  webview = WEBKIT_WEB_VIEW (xw->widget_osr);
+  webview = XWIDGET_WEBKIT_VIEW (xw);
   controller = webkit_web_view_get_find_controller (webview);
   webkit_find_controller_search_previous (controller);
   unblock_input ();
@@ -3675,7 +4267,7 @@ using `xwidget-webkit-search'.  */)
 
 #ifdef USE_GTK
   block_input ();
-  webview = WEBKIT_WEB_VIEW (xw->widget_osr);
+  webview = XWIDGET_WEBKIT_VIEW (xw);
   controller = webkit_web_view_get_find_controller (webview);
   webkit_find_controller_search_finish (controller);
 
@@ -3738,7 +4330,7 @@ to "about:blank".  */)
 
   data = SSDATA (text);
   uri = SSDATA (base_uri);
-  webview = WEBKIT_WEB_VIEW (xw->widget_osr);
+  webview = XWIDGET_WEBKIT_VIEW (xw);
 
   block_input ();
   webkit_web_view_load_html (webview, data, uri);
@@ -3788,7 +4380,7 @@ LIMIT is not specified or nil, it is treated as `50'.  */)
   CHECK_LIVE_XWIDGET (xwidget);
   xw = XXWIDGET (xwidget);
 
-  webview = WEBKIT_WEB_VIEW (xw->widget_osr);
+  webview = XWIDGET_WEBKIT_VIEW (xw);
   list = webkit_web_view_get_back_forward_list (webview);
   item = webkit_back_forward_list_get_current_item (list);
   lim = XFIXNAT (limit);
@@ -3854,7 +4446,6 @@ store cookies in FILE and load them from there.  */)
 #ifdef USE_GTK
   struct xwidget *xw;
   WebKitWebView *webview;
-  WebKitWebContext *context;
   WebKitCookieManager *manager;
 
   CHECK_LIVE_XWIDGET (xwidget);
@@ -3863,9 +4454,14 @@ store cookies in FILE and load them from there.  */)
   CHECK_STRING (file);
 
   block_input ();
-  webview = WEBKIT_WEB_VIEW (xw->widget_osr);
-  context = webkit_web_view_get_context (webview);
+  webview = XWIDGET_WEBKIT_VIEW (xw);
+#ifdef HAVE_WPE
+  WebKitNetworkSession *session = webkit_web_view_get_network_session (webview);
+  manager = webkit_network_session_get_cookie_manager (session);
+#else
+  WebKitWebContext *context = webkit_web_view_get_context (webview);
   manager = webkit_web_context_get_cookie_manager (context);
+#endif
   webkit_cookie_manager_set_persistent_storage (manager,
 						SSDATA (ENCODE_UTF_8 (file)),
 						WEBKIT_COOKIE_PERSISTENT_STORAGE_TEXT);
@@ -3893,7 +4489,7 @@ XWIDGET as part of loading a page.  */)
 
   block_input ();
 #ifdef USE_GTK
-  webview = WEBKIT_WEB_VIEW (xw->widget_osr);
+  webview = XWIDGET_WEBKIT_VIEW (xw);
   webkit_web_view_stop_loading (webview);
 #elif defined NS_IMPL_COCOA
   nsxwidget_webkit_stop_loading (xw);
@@ -3994,11 +4590,6 @@ to take effect.  */);
   x_window_to_xwv_map = CALLN (Fmake_hash_table, QCtest, Qeq);
 
   staticpro (&x_window_to_xwv_map);
-
-#if WEBKIT_CHECK_VERSION (2, 34, 0)
-  dummy_tooltip_string = build_string ("");
-  staticpro (&dummy_tooltip_string);
-#endif
 #endif
   DEFSYM (Qdownload_callback, "download-callback");
   DEFSYM (Qjavascript_callback, "javascript-callback");
@@ -4232,6 +4823,51 @@ kill_xwidget (struct xwidget *xw)
   Vxwidget_list = Fcopy_sequence (internal_xwidget_list);
 #ifdef USE_GTK
   xw->buffer = Qnil;
+
+#ifdef HAVE_WPE
+  if (xw->wpe_web_view)
+    {
+      g_object_remove_weak_pointer (G_OBJECT (xw->wpe_web_view),
+				    (gpointer *) &xw->wpe_web_view);
+      g_object_unref (xw->wpe_web_view);
+      xw->wpe_web_view = NULL;
+    }
+  wpe_cancel_frame_watchdog (xw);
+  if (xw->wpe_web_view_backend)
+    {
+      xw->wpe_web_view_backend = NULL;
+    }
+#ifdef HAVE_EPOXY
+  if (xw->wpe_egl_image)
+    {
+      wpe_view_backend_exportable_fdo_egl_dispatch_release_exported_image
+	(xw->wpe_exportable, xw->wpe_egl_image);
+      xw->wpe_egl_image = NULL;
+    }
+  xw->wpe_use_egl = false;
+#endif
+  if (xw->wpe_exportable)
+    {
+      wpe_view_backend_exportable_fdo_destroy (xw->wpe_exportable);
+      xw->wpe_exportable = NULL;
+    }
+  xw->wpe_backend = NULL;
+
+  if (xw->wpe_surface)
+    {
+      cairo_surface_destroy (xw->wpe_surface);
+      xw->wpe_surface = NULL;
+    }
+  if (xw->wpe_surface_data)
+    {
+      xfree (xw->wpe_surface_data);
+      xw->wpe_surface_data = NULL;
+    }
+  xw->wpe_surface_size = 0;
+  xw->wpe_surface_width = 0;
+  xw->wpe_surface_height = 0;
+  xw->wpe_surface_stride = 0;
+#endif
 
   if (xw->widget_osr && xw->widgetwindow_osr)
     {
